@@ -332,7 +332,7 @@ func onSetDefaultValue(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	return updateColumnDefaultValue(t, job, newCol, &newCol.Name)
 }
 
-func (w *worker) onModifyColumn(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+func (w *worker) onModifyColumn(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	newCol := &model.ColumnInfo{}
 	oldColName := &model.CIStr{}
 	pos := &ast.ColumnPosition{}
@@ -344,12 +344,34 @@ func (w *worker) onModifyColumn(t *meta.Meta, job *model.Job) (ver int64, _ erro
 		return ver, errors.Trace(err)
 	}
 
-	return w.doModifyColumn(t, job, newCol, oldColName, pos, modifyColumnTp, updatedAutoRandomBits)
+	return w.doModifyColumn(d, t, job, newCol, oldColName, pos, modifyColumnTp, updatedAutoRandomBits)
+}
+
+func migrateAutoIDToAutoRandID(d *ddlCtx, t *meta.Meta, dbInfo *model.DBInfo, tblInfo *model.TableInfo) error {
+	tbl, err := getTable(d.store, dbInfo.ID, tblInfo)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if alloc := tbl.Allocators(nil).Get(autoid.AutoRandomType); alloc != nil {
+		newBase, err := t.GetAutoTableID(dbInfo.ID, tblInfo.ID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		newEnd := newBase - 1
+		err = alloc.Rebase(tblInfo.ID, newEnd, false)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if err := t.CleanAutoID(dbInfo.ID, tblInfo.ID); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
 }
 
 // doModifyColumn updates the column information and reorders all columns.
 func (w *worker) doModifyColumn(
-	t *meta.Meta, job *model.Job, newCol *model.ColumnInfo, oldName *model.CIStr,
+	d *ddlCtx, t *meta.Meta, job *model.Job, newCol *model.ColumnInfo, oldName *model.CIStr,
 	pos *ast.ColumnPosition, modifyColumnTp byte, newAutoRandBits uint64) (ver int64, _ error) {
 	dbInfo, err := checkSchemaExistAndCancelNotExistJob(t, job)
 	if err != nil {
@@ -393,7 +415,7 @@ func (w *worker) doModifyColumn(
 	})
 
 	if newAutoRandBits > 0 {
-		if err := checkAndApplyNewAutoRandomBits(job, t, tblInfo, newCol, oldName, newAutoRandBits); err != nil {
+		if err := checkAndApplyNewAutoRandomBits(job, t, tblInfo, newCol, oldCol, newAutoRandBits); err != nil {
 			return ver, errors.Trace(err)
 		}
 	}
@@ -477,6 +499,14 @@ func (w *worker) doModifyColumn(
 		}
 	}
 
+	convertedFromAutoInc := newAutoRandBits > 0 && mysql.HasAutoIncrementFlag(oldCol.Flag)
+	if convertedFromAutoInc {
+		err := migrateAutoIDToAutoRandID(d, t, dbInfo, tblInfo)
+		if err != nil {
+			job.State = model.JobStateCancelled
+		}
+	}
+
 	ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, true)
 	if err != nil {
 		// Modified the type definition of 'null' to 'not null' before this, so rollBack the job when an error occurs.
@@ -489,7 +519,7 @@ func (w *worker) doModifyColumn(
 }
 
 func checkAndApplyNewAutoRandomBits(job *model.Job, t *meta.Meta, tblInfo *model.TableInfo,
-	newCol *model.ColumnInfo, oldName *model.CIStr, newAutoRandBits uint64) error {
+	newCol *model.ColumnInfo, oldCol *model.ColumnInfo, newAutoRandBits uint64) error {
 	schemaID := job.SchemaID
 	newLayout := autoid.NewAutoRandomIDLayout(&newCol.FieldType, newAutoRandBits)
 
@@ -502,13 +532,22 @@ func checkAndApplyNewAutoRandomBits(job *model.Job, t *meta.Meta, tblInfo *model
 	if err != nil {
 		return err
 	}
+
+	convertedFromAutoInc := mysql.HasAutoIncrementFlag(oldCol.Flag)
+	if convertedFromAutoInc {
+		currentIncBitsVal, err = t.GetAutoTableID(schemaID, tblInfo.ID)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Find the max number of available shard bits by
 	// counting leading zeros in current inc part of auto_random ID.
 	availableBits := bits.LeadingZeros64(uint64(currentIncBitsVal))
 	isOccupyingIncBits := newLayout.TypeBitsLength-newLayout.IncrementalBits > uint64(availableBits)
 	if isOccupyingIncBits {
 		availableBits := mathutil.Min(autoid.MaxAutoRandomBits, availableBits)
-		errMsg := fmt.Sprintf(autoid.AutoRandomOverflowErrMsg, availableBits, newAutoRandBits, oldName.O)
+		errMsg := fmt.Sprintf(autoid.AutoRandomOverflowErrMsg, availableBits, newAutoRandBits, oldCol.Name.O)
 		job.State = model.JobStateCancelled
 		return ErrInvalidAutoRandom.GenWithStackByArgs(errMsg)
 	}

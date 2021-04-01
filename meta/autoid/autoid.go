@@ -147,6 +147,17 @@ func (all Allocators) Get(allocType AllocatorType) Allocator {
 	return nil
 }
 
+// Filter filters all the allocators that match pred.
+func (all Allocators) Filter(pred func(Allocator) bool) Allocators {
+	var ret Allocators
+	for _, a := range all {
+		if pred(a) {
+			ret = append(ret, a)
+		}
+	}
+	return ret
+}
+
 type allocator struct {
 	mu    sync.Mutex
 	base  int64
@@ -427,6 +438,10 @@ func NewSequenceAllocator(store kv.Storage, dbID int64, info *model.SequenceInfo
 func NewAllocatorsFromTblInfo(store kv.Storage, schemaID int64, tblInfo *model.TableInfo) Allocators {
 	var allocs []Allocator
 	dbID := tblInfo.GetDBID(schemaID)
+
+	// TODO: should add IsCommonHandle variables.
+	// hasRowID := !tblInfo.PKIsHandle && !tblInfo.IsCommonHandle
+	// hasAutoIncID := tblInfo.GetAutoIncrementColInfo() != nil
 	if tblInfo.AutoIdCache > 0 {
 		allocs = append(allocs, NewAllocator(store, dbID, tblInfo.IsAutoIncColUnsigned(), RowIDAllocType, CustomAutoIncCacheOption(tblInfo.AutoIdCache)))
 	} else {
